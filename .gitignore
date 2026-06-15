@@ -1,0 +1,6 @@
+*.mat 
+*.fig 
+data/ 
+Case*/ 
+*.img 
+Figure*.png 
