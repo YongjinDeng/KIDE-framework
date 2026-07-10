@@ -1,175 +1,180 @@
 %% ========================================================================
-%  Phase 1: 严谨的算法基线对比 (For Radiotherapy and Oncology)
-%  模型对比:
-%   1. OLS (Ordinary Least Squares): 完全无约束，代表最脆弱的纯数据拟合
-%   2. PLS (Partial Least Squares): 医学统计中常用的经典基线
-%   3. PIDE (Physics-Informed): 带有特征值能量惩罚(生物力学约束)的模型
+%  Phase 1: SGRT 结构性遮挡噪声模拟与多基线全面评估 (最终完美版)
+%  全面指标: Mean TRE, 95th Percentile TRE, Success Rate (<2mm), 3D Jacobian
 % =========================================================================
 clear; clc; close all;
 
 main_path = 'D:/0临床科研/四维剂量重建/data/';
-output_summary = [];
 
 % 存储全局 3000 个点的误差
-all_err = struct('Initial', [], 'OLS', [], 'PLS', [], 'PIDE', []);
+all_err = struct('Initial', [], 'OLS', [], 'PLS', [], 'KIDE', []);
+all_jac = struct('OLS', [], 'PLS', [], 'KIDE', []);
 
 fprintf('==================================================\n');
-fprintf('Phase 1: SGRT 实时追踪算法多基线评估 (10 Cases)\n');
+fprintf('Phase 1: SGRT 结构性遮挡噪声模拟与多基线全面评估\n');
 fprintf('==================================================\n');
 
 for case_id = 1:10
     case_path = fullfile(main_path, sprintf('Case%dPack/', case_id));
     processed_file = fullfile(case_path, 'Processed', sprintf('Case%d_DVF_Depth.mat', case_id));
-    
     if ~exist(processed_file, 'file')
-        fprintf('Case %d: 数据未预处理，跳过。\n', case_id);
-        continue;
+        fprintf('  ⚠️ Case %d: 数据未预处理，跳过。\n', case_id);
+        continue; 
     end
     
-    % --- 1. 加载数据 ---
     load(processed_file, 'depth_maps', 'DVFs', 'pts_T00', 'pts_T50');
     [img_size, voxel_spacing] = get_dirlab_params(case_id);
     
-    % --- 2. 严谨的特征提取 ---
-    D_mat = reshape(depth_maps, [], 10)';
-    [~, score_S, ~] = pca(D_mat, 'Economy', true);
-    k_feat = min(3, size(score_S, 2));
-    Z_surf = score_S(:, 1:k_feat);
+    % --- 1. 特征提取 ---
+    train_depths = reshape(depth_maps(:,:,1:5), [], 5)';
+    [coeff_S, score_S, ~] = pca(train_depths, 'Economy', true);
+    k_feat = min(3, size(score_S, 2)); 
+    Z_train = score_S(:, 1:k_feat); 
+    mean_depth = mean(train_depths, 1);
     
-    V_mat = zeros(10, numel(DVFs{1}), 'single');
-    for i = 1:10, V_mat(i, :) = DVFs{i}(:); end
-    [coeff_V, score_V, latent_V] = pca(V_mat, 'Economy', true);
-    Y_dvf = score_V(:, 1:k_feat); 
-    mean_V = mean(V_mat, 1);
+    % --- 2. 3D空间降采样 (保持微观拓扑) ---
+    if prod(img_size) > 1e6, scale_factor = 0.5; else, scale_factor = 1.0; end
+    small_size = max(floor(img_size * scale_factor), [1, 1, 1]);
     
-    % --- 3. 模型训练 (T00-T40 模拟计划阶段 4DCT 先验) ---
-    Z_train = Z_surf(1:5, :); 
-    Y_train = Y_dvf(1:5, :);
+    V_mat_sampled = zeros(10, prod(small_size)*3, 'single');
+    for i = 1:10
+        dvf_small = zeros([small_size, 3], 'single');
+        for c = 1:3
+            dvf_small(:,:,:,c) = imresize3(DVFs{i}(:,:,:,c), small_size, 'linear');
+        end
+        V_mat_sampled(i, :) = dvf_small(:);
+    end
+    [coeff_V, score_V, latent_V] = pca(V_mat_sampled, 'Economy', true);
+    Y_train = score_V(1:5, 1:k_feat); 
+    mean_V = mean(V_mat_sampled, 1);
     
-    % Model A: OLS (Ordinary Least Squares) - 无正则化
-    W_ols = (Z_train' * Z_train + 1e-6*eye(k_feat)) \ (Z_train' * Y_train);
+    % --- 3. 多模型训练 (OLS, PLS, KIDE) ---
+    W_ols = (Z_train'*Z_train + 1e-6*eye(k_feat)) \ (Z_train'*Y_train);
     
-    % Model B: PLS (Partial Least Squares) - 经典统计基线
     [~, ~, ~, ~, beta_pls] = plsregress(Z_train, Y_train, k_feat);
-    W_pls_intercept = beta_pls(1,:); 
+    W_pls_int = beta_pls(1,:); 
     W_pls = beta_pls(2:end,:);
     
-    % Model C: PIDE (Physics-Informed) - 谱能量约束
-    H = Z_train' * Z_train; scale_H = max(abs(H(:))); if scale_H < 1e-6, scale_H = 1; end
-    alpha_physics = 5.0;
+    H = Z_train'*Z_train; 
+    scale_H = max(abs(H(:))); 
+    if scale_H < 1e-6, scale_H = 1; end
     penalty_diag = 1 ./ (latent_V(1:k_feat) / max(latent_V(1:k_feat)) + 1e-4);
-    penalty_diag(1) = 0; % 绝对保护主要呼吸成分
-    W_pide = (H + alpha_physics * scale_H * diag(penalty_diag)) \ (Z_train' * Y_train);
+    penalty_diag(1) = 0;
+    W_kide = (H + 5.0 * scale_H * diag(penalty_diag)) \ (Z_train'*Y_train);
     
-    % --- 4. 模拟真实的 SGRT 临床环境 (测试阶段 T50) ---
-    % 仅在表面特征注入高频噪声，模拟衣服遮挡、反光、体表松弛
-    Z_test_clean = Z_surf(6, :); 
+    % --- 4. 注入真实的结构性遮挡噪声 (修复索引边界 Bug) ---
+    clean_test_depth = depth_maps(:,:,6);
     rng(case_id); 
-    sensor_noise = randn(1, k_feat) .* std(Z_train) .* [0.1, 2.0, 5.0]; 
-    Z_test_noisy = Z_test_clean + sensor_noise;
+    noisy_test_depth = clean_test_depth + imgaussfilt(randn(size(clean_test_depth)), 2.0) * 5.0;
     
-    % 推断
-    Y_pred_ols  = Z_test_noisy * W_ols;
-    Y_pred_pls  = Z_test_noisy * W_pls + W_pls_intercept;
-    Y_pred_pide = Z_test_noisy * W_pide;
+    [r, c] = size(noisy_test_depth);
+    occ_w = round(min(r, c) * 0.15); % 自适应遮挡大小
     
-    % --- 5. DVF 重建与 Jacobians (组织撕裂评估) ---
-    dvf_ols  = reshape(mean_V + Y_pred_ols * coeff_V(:, 1:k_feat)', [img_size, 3]);
-    dvf_pls  = reshape(mean_V + Y_pred_pls * coeff_V(:, 1:k_feat)', [img_size, 3]);
-    dvf_pide = reshape(mean_V + Y_pred_pide * coeff_V(:, 1:k_feat)', [img_size, 3]);
+    % 安全的边界检查
+    cx = round(r/2); cy = round(c/2);
+    r_start = max(1, cx - occ_w); r_end = min(r, cx + occ_w);
+    c_start = max(1, cy - occ_w); c_end = min(c, cy + occ_w);
     
-    jac_ols  = calculate_jacobian_folding(dvf_ols, voxel_spacing);
-    jac_pls  = calculate_jacobian_folding(dvf_pls, voxel_spacing);
-    jac_pide = calculate_jacobian_folding(dvf_pide, voxel_spacing);
+    noisy_test_depth(r_start:r_end, c_start:c_end) = noisy_test_depth(r_start:r_end, c_start:c_end) + 150.0;
     
-    % --- 6. 临床金标准验证: Landmark TRE ---
+    Z_test_noisy = (noisy_test_depth(:)' - mean_depth) * coeff_S;
+    Z_test_noisy = Z_test_noisy(1:k_feat);
+    
+    % --- 5. 推断与 3D 上采样 ---
+    Y_pred_ols = Z_test_noisy * W_ols; 
+    Y_pred_pls = Z_test_noisy * W_pls + W_pls_int;
+    Y_pred_kide = Z_test_noisy * W_kide;
+    
+    dvf_ols_small = reshape(mean_V + Y_pred_ols * coeff_V(:, 1:k_feat)', [small_size, 3]);
+    dvf_pls_small = reshape(mean_V + Y_pred_pls * coeff_V(:, 1:k_feat)', [small_size, 3]);
+    dvf_kide_small = reshape(mean_V + Y_pred_kide * coeff_V(:, 1:k_feat)', [small_size, 3]);
+    
+    dvf_ols = zeros([img_size, 3], 'single');
+    dvf_pls = zeros([img_size, 3], 'single');
+    dvf_kide = zeros([img_size, 3], 'single');
+    for ch = 1:3
+        dvf_ols(:,:,:,ch) = imresize3(dvf_ols_small(:,:,:,ch), img_size, 'linear');
+        dvf_pls(:,:,:,ch) = imresize3(dvf_pls_small(:,:,:,ch), img_size, 'linear');
+        dvf_kide(:,:,:,ch) = imresize3(dvf_kide_small(:,:,:,ch), img_size, 'linear');
+    end
+    
+    % --- 6. 全面几何与拓扑验证 ---
     [Xm, Ym, Zm] = meshgrid(1:img_size(2), 1:img_size(1), 1:img_size(3));
-    
     err_init = sqrt(sum(((pts_T50 - pts_T00) .* voxel_spacing).^2, 2));
     err_ols  = compute_tre(dvf_ols, pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
     err_pls  = compute_tre(dvf_pls, pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
-    err_pide = compute_tre(dvf_pide, pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
+    err_kide = compute_tre(dvf_kide, pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
     
-    % 收集数据
-    all_err.Initial = [all_err.Initial; err_init];
-    all_err.OLS = [all_err.OLS; err_ols];
-    all_err.PLS = [all_err.PLS; err_pls];
-    all_err.PIDE = [all_err.PIDE; err_pide];
+    scaled_vs = voxel_spacing .* (img_size ./ small_size);
+    jac_ols = calculate_jacobian_folding(dvf_ols_small, scaled_vs);
+    jac_pls = calculate_jacobian_folding(dvf_pls_small, scaled_vs);
+    jac_kide = calculate_jacobian_folding(dvf_kide_small, scaled_vs);
     
-    output_summary = [output_summary; struct('case_id', case_id, 'init', mean(err_init), ...
-        'ols', mean(err_ols), 'pls', mean(err_pls), 'pide', mean(err_pide), ...
-        'jac_o', jac_ols, 'jac_p', jac_pls, 'jac_pi', jac_pide)];
+    all_err.Initial = [all_err.Initial; err_init]; 
+    all_err.OLS = [all_err.OLS; err_ols]; all_err.PLS = [all_err.PLS; err_pls]; all_err.KIDE = [all_err.KIDE; err_kide];
+    all_jac.OLS = [all_jac.OLS; jac_ols]; all_jac.PLS = [all_jac.PLS; jac_pls]; all_jac.KIDE = [all_jac.KIDE; jac_kide];
     
-    fprintf('  Case %02d | Init: %4.2f | OLS: %4.2f | PLS: %4.2f | PIDE: %4.2f mm\n', ...
-        case_id, mean(err_init), mean(err_ols), mean(err_pls), mean(err_pide));
+    fprintf('  Case %02d | TRE (95th%%): OLS = %.2f (%.2f) | PLS = %.2f (%.2f) | KIDE = %.2f (%.2f) mm\n', ...
+        case_id, mean(err_ols), prctile(err_ols, 95), mean(err_pls), prctile(err_pls, 95), mean(err_kide), prctile(err_kide, 95));
 end
 
-%% ========================================================================
-%  客观结果输出
-% =========================================================================
+% --- 生成高质量出版级 Boxplot ---
+fig1 = figure('Color', 'w', 'Position', [100, 100, 650, 500]);
+group_data = [all_err.Initial; all_err.OLS; all_err.PLS; all_err.KIDE];
+group_labels = [ones(length(all_err.Initial),1); 2*ones(length(all_err.OLS),1); ...
+                3*ones(length(all_err.PLS),1); 4*ones(length(all_err.KIDE),1)];
+boxplot(group_data, group_labels, 'Labels', {'No Tracking', 'OLS (Baseline)', 'PLS', 'KIDE (Ours)'}, ...
+        'Colors', [0.2 0.2 0.2; 0.8 0.2 0.2; 0.2 0.5 0.8; 0.2 0.6 0.2], 'Symbol', 'o', 'OutlierSize', 4);
+ylabel('Target Registration Error (mm)', 'FontSize', 12, 'FontWeight', 'bold');
+title('Tracking Robustness under Clinical Occlusion Noise (n=3,000)', 'FontSize', 14);
+yline(2.0, 'r--', 'Clinical Threshold (2mm)', 'LineWidth', 1.5);
+grid on; 
+set(gca, 'FontSize', 11, 'LineWidth', 1.2); 
+ylim([0, 30]); % 限制Y轴范围，突出箱体对比
+exportgraphics(fig1, fullfile(main_path, 'Figure2_TRE_Boxplot.png'), 'Resolution', 300);
+fprintf('  ✅ Figure 2 已保存\n');
+
+%% --- 全局统计输出 ---
 fprintf('\n==================================================\n');
-fprintf('临床结果大汇总 (n=10, Landmarks=3000)\n');
-fprintf('  Initial Motion : %.2f ± %.2f mm\n', mean(all_err.Initial), std(all_err.Initial));
-fprintf('  OLS Error      : %.2f ± %.2f mm  (Jacobian Fold: %.2f %%)\n', mean(all_err.OLS), std(all_err.OLS), mean([output_summary.jac_o]));
-fprintf('  PLS Error      : %.2f ± %.2f mm  (Jacobian Fold: %.2f %%)\n', mean(all_err.PLS), std(all_err.PLS), mean([output_summary.jac_p]));
-fprintf('  PIDE Error     : %.2f ± %.2f mm  (Jacobian Fold: %.2f %%)\n', mean(all_err.PIDE), std(all_err.PIDE), mean([output_summary.jac_pi]));
+fprintf('临床结果大汇总 (n=3000 Landmarks)\n');
+fprintf('  No Tracking : %.2f ± %.2f mm (95th: %.2f mm) | Success(<2mm): %5.1f%%\n', ...
+    mean(all_err.Initial), std(all_err.Initial), prctile(all_err.Initial,95), mean(all_err.Initial < 2.0)*100);
+fprintf('  OLS Error   : %.2f ± %.2f mm (95th: %.2f mm) | Success(<2mm): %5.1f%% | Jac Fold: %.2f%%\n', ...
+    mean(all_err.OLS), std(all_err.OLS), prctile(all_err.OLS,95), mean(all_err.OLS < 2.0)*100, mean(all_jac.OLS));
+fprintf('  PLS Error   : %.2f ± %.2f mm (95th: %.2f mm) | Success(<2mm): %5.1f%% | Jac Fold: %.2f%%\n', ...
+    mean(all_err.PLS), std(all_err.PLS), prctile(all_err.PLS,95), mean(all_err.PLS < 2.0)*100, mean(all_jac.PLS));
+fprintf('  KIDE Error  : %.2f ± %.2f mm (95th: %.2f mm) | Success(<2mm): %5.1f%% | Jac Fold: %.2f%%\n', ...
+    mean(all_err.KIDE), std(all_err.KIDE), prctile(all_err.KIDE,95), mean(all_err.KIDE < 2.0)*100, mean(all_jac.KIDE));
 fprintf('==================================================\n');
 
-% 保存结果，供 Phase 2 剂量重建使用
-save(fullfile(main_path, 'Phase1_Baselines_Results.mat'), 'all_err', 'output_summary');
+[~, p_ols] = ttest(all_err.KIDE, all_err.OLS);
+[~, p_pls] = ttest(all_err.KIDE, all_err.PLS);
+fprintf('  Paired t-test (KIDE vs OLS): p = %.2e\n', p_ols);
+fprintf('  Paired t-test (KIDE vs PLS): p = %.2e\n', p_pls);
+fprintf('==================================================\n');
 
-%% --- 内部函数库 ---
-function [img_size, voxel_spacing] = get_dirlab_params(case_id)
-    if case_id <= 5, img_size = [256, 256, 94]; voxel_spacing = [0.97, 0.97, 2.5];
-    else, img_size = [512, 512, 128]; voxel_spacing = [0.97, 0.97, 2.5]; end
-    switch case_id
-        case 1, img_size(3)=94; case 2, img_size(3)=112; voxel_spacing(1:2)=[1.16, 1.16];
-        case 3, img_size(3)=104; voxel_spacing(1:2)=[1.15, 1.15]; case 4, img_size(3)=99; voxel_spacing(1:2)=[1.13, 1.13];
-        case 5, img_size(3)=106; voxel_spacing(1:2)=[1.10, 1.10]; case 7, img_size(3)=136; case 10, img_size(3)=120;
-    end
-end
-
+%% --- 辅助函数 ---
 function jac_fold = calculate_jacobian_folding(DVF, vs)
-    [~, dy_dx, ~] = gradient(DVF(:,:,:,2), vs(1), vs(2), vs(3));
-    jac_fold = sum(dy_dx(:) <= -1) / numel(dy_dx) * 100; 
+    [du1_dcol, du1_drow, du1_dslice] = gradient(DVF(:,:,:,1), vs(1), vs(2), vs(3));
+    [du2_dcol, du2_drow, du2_dslice] = gradient(DVF(:,:,:,2), vs(1), vs(2), vs(3));
+    [du3_dcol, du3_drow, du3_dslice] = gradient(DVF(:,:,:,3), vs(1), vs(2), vs(3));
+    J11 = 1 + du1_dcol; J12 = du1_drow; J13 = du1_dslice;
+    J21 = du2_dcol; J22 = 1 + du2_drow; J23 = du2_dslice;
+    J31 = du3_dcol; J32 = du3_drow; J33 = 1 + du3_dslice;
+    J_det = J11.*(J22.*J33 - J23.*J32) - J12.*(J21.*J33 - J23.*J31) + J13.*(J21.*J32 - J22.*J31);
+    jac_fold = sum(J_det(:) <= 0) / numel(J_det) * 100;
 end
-
 function tre = compute_tre(DVF, pts0, pts50, vs, Xm, Ym, Zm)
     dx = interp3(Xm, Ym, Zm, double(DVF(:,:,:,1)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
     dy = interp3(Xm, Ym, Zm, double(DVF(:,:,:,2)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
     dz = interp3(Xm, Ym, Zm, double(DVF(:,:,:,3)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
     tre = sqrt(sum((((pts0 + [dx, dy, dz]) - pts50) .* vs).^2, 2));
 end
-
-% 假设 all_err.Initial, all_err.OLS, all_err.PLS, all_err.PIDE 已经存在工作区
-fprintf('\n==================================================\n');
-fprintf('🏥 临床意义与统计学检验 (For Green Journal) 🏥\n');
-fprintf('==================================================\n');
-
-% 1. 统计显著性检验 (Paired t-test)
-[~, p_ols] = ttest(all_err.PIDE, all_err.OLS);
-[~, p_pls] = ttest(all_err.PIDE, all_err.PLS);
-[~, p_init] = ttest(all_err.PIDE, all_err.Initial);
-
-fprintf('【统计显著性 (Paired t-test)】\n');
-fprintf('  PIDE vs Initial : p = %.2e (PIDE 显著优于不干预)\n', p_init);
-fprintf('  PIDE vs OLS     : p = %.2e (PIDE 显著优于纯数据驱动)\n', p_ols);
-fprintf('  PIDE vs PLS     : p = %.2e (PIDE 显著优于传统统计)\n', p_pls);
-
-% 2. 临床成功率量化 (TRE 阈值)
-% 绿皮书标准: <2mm 为精准靶区覆盖, >5mm 为可能导致脱靶的危险误差
-clin_success_2mm = @(x) mean(x < 2.0) * 100;
-clin_danger_5mm  = @(x) mean(x > 5.0) * 100;
-
-fprintf('\n【临床靶区覆盖成功率 (TRE < 2mm) ↑】\n');
-fprintf('  Initial : %5.1f %%\n', clin_success_2mm(all_err.Initial));
-fprintf('  OLS     : %5.1f %%\n', clin_success_2mm(all_err.OLS));
-fprintf('  PLS     : %5.1f %%\n', clin_success_2mm(all_err.PLS));
-fprintf('  PIDE    : %5.1f %% (临床可用性最高)\n', clin_success_2mm(all_err.PIDE));
-
-fprintf('\n【临床高危脱靶率 (TRE > 5mm) ↓】\n');
-fprintf('  Initial : %5.1f %%\n', clin_danger_5mm(all_err.Initial));
-fprintf('  OLS     : %5.1f %% (极度危险)\n', clin_danger_5mm(all_err.OLS));
-fprintf('  PLS     : %5.1f %% (极度危险)\n', clin_danger_5mm(all_err.PLS));
-fprintf('  PIDE    : %5.1f %% (极大地保障了患者安全)\n', clin_danger_5mm(all_err.PIDE));
-fprintf('==================================================\n');
+function [img_size, vs] = get_dirlab_params(case_id)
+    if case_id<=5, img_size=[256, 256, 94]; vs=[0.97, 0.97, 2.5]; else, img_size=[512, 512, 128]; vs=[0.97, 0.97, 2.5]; end
+    switch case_id
+        case 1, img_size(3)=94; case 2, img_size(3)=112; vs(1:2)=[1.16, 1.16];
+        case 3, img_size(3)=104; vs(1:2)=[1.15, 1.15]; case 4, img_size(3)=99; vs(1:2)=[1.13, 1.13];
+        case 5, img_size(3)=106; vs(1:2)=[1.10, 1.10]; case 7, img_size(3)=136; case 10, img_size(3)=120;
+    end
+end
