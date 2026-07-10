@@ -1,25 +1,23 @@
-# Physics-Informed Depth-Enhanced (PIDE) Framework
+# Robust Markerless Surface-to-Internal Tracking via Kinematics-Informed Prior (KIDE)
 
-## Overview
-This repository contains the MATLAB implementation of the Physics-Informed Depth-Enhanced (PIDE) framework for surface-to-internal deformation prediction in lung SBRT.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![MATLAB 2021+](https://img.shields.io/badge/MATLAB-2021+-blue.svg)]()
 
-## Publication
-Deng Y, Chen R. Physics-informed surface-to-internal deformation prediction for intra-fraction motion management in lung SBRT: An in silico geometric and dosimetric validation. *Radiotherapy and Oncology*, 2026.
+This repository contains the official implementation of the **KIDE** framework, as described in our paper submitted to *Artificial Intelligence in Medicine*.
 
-## Requirements
-- MATLAB R2020a or later
-- Image Processing Toolbox
-- Statistics and Machine Learning Toolbox
+## 📌 Overview
+Unconstrained data-driven models (e.g., OLS, unconstrained deep learning) are highly vulnerable to clinical occlusion noise in Surface-Guided Radiotherapy (SGRT). **KIDE** introduces a patient-specific kinematic spectral penalty that acts as a biomechanical low-pass filter. It mathematically guarantees 0.00% Jacobian folding (microscopic topology) and effectively prevents false dosimetric alarms (macroscopic geometry).
 
-## Data
-This code uses the publicly available DIR-Lab 4DCT dataset.  
-Access: http://www.dir-lab.com/
+## 🚀 Key Features
+- **Geometric Robustness:** Maintains high clinical tracking success rates even under 15% structural occlusion noise.
+- **Biomechanical Plausibility:** 100% physically plausible deformation vector fields (0% Jacobian folding).
+- **Heterogeneity-Aware Dosimetry:** Built-in pseudo-dose engine utilizing Radiological Path Lengths (RPL) for D95% and V20 evaluation.
 
-## Usage
-1. Download DIR-Lab data to `./data/Case1Pack/` ... `./data/Case10Pack/`
-2. Run `Batch_Process_All_Cases.m`
-3. Run `Phase1_Batch_Process_Baselines.m`
-4. Run `Phase2_Clinical_Dose_Engine.m`
+## 📂 Quick Start
+1. Clone the repository: `git clone https://github.com/YourName/KIDE-framework.git`
+2. Download the publicly available [DIR-Lab 4DCT dataset](http://www.dir-lab.com/).
+3. Run `src/Phase1_Geometric_Evaluation.m` to reproduce TRE boxplots and Jacobian analysis.
+4. Run `src/Phase2_Dosimetric_Evaluation.m` to generate dose maps and Dose-Volume Histograms (DVH).
 
-## Citation
-If you use this code, please cite our paper.
+## 📊 Citation
+If you find this code useful for your research, please consider citing our paper (Citation details to be updated upon publication).
