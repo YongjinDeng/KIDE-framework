@@ -1,6 +1,6 @@
 %% ========================================================================
-%  Batch Process: 批量处理 DIR-Lab Case 1-10
-%  For journal: Radiotherapy and Oncology
+%  Batch Process: 批量处理 DIR-Lab Case 1-10 (Data Leakage Fixed)
+%  For journal: Radiotherapy and Oncology / PMB
 % =========================================================================
 clear; clc; close all;
 
@@ -11,7 +11,7 @@ output_summary = [];
 all_initial_err = []; all_base_err = []; all_pide_err = [];
 
 fprintf('==================================================\n');
-fprintf('批量处理 DIR-Lab 10 Cases\n');
+fprintf('批量处理 DIR-Lab 10 Cases (Data Leakage Fixed)\n');
 fprintf('==================================================\n');
 
 for case_id = 1:10
@@ -101,20 +101,45 @@ for case_id = 1:10
         fprintf('  ✅ 数据处理与缓存完成\n');
     end
     
-    % PCA 与模型训练
-    fprintf('  PCA 降维与模型训练...\n');
-    D_mat = reshape(depth_maps, [], 10)';
-    [~, score_S, ~] = pca(D_mat, 'Economy', true);
+    % --- PCA 与模型训练（仅使用 Phase 1-5）---
+    fprintf('  PCA 降维与模型训练 (仅 Phase 1-5)...\n');
+    
+    % 1. 深度特征 PCA：仅 Phase 1-5
+    D_train = reshape(depth_maps(:,:,1:5), [], 5)';
+    mean_depth = mean(D_train, 1);
+    [coeff_S, score_S, ~] = pca(D_train, 'Economy', true);
     k_feat = min(3, size(score_S, 2));
     Z_surf = score_S(:, 1:k_feat);
     
-    V_mat = zeros(10, numel(DVFs{1}), 'single');
-    for i = 1:10, V_mat(i, :) = DVFs{i}(:); end
-    [coeff_V, score_V, latent_V] = pca(V_mat, 'Economy', true);
-    Y_dvf = score_V(:, 1:k_feat); mean_V = mean(V_mat, 1);
+    % 2. DVF PCA：仅 Phase 1-5（内存优化）
+    nVox = prod(img_size);
+    if nVox > 1e6
+        scale_factor = 0.5;
+    elseif nVox > 200000
+        scale_factor = 0.7;
+    else
+        scale_factor = 1.0;
+    end
+    small_size = max(floor(img_size * scale_factor), [1, 1, 1]);
+    n_sample = prod(small_size) * 3;
     
-    Z_train = Z_surf; Y_train = Y_dvf;
-    H = Z_train' * Z_train; scale_H = max(abs(H(:))); if scale_H < 1e-6, scale_H = 1; end
+    V_train_sampled = zeros(5, n_sample, 'single');
+    for i = 1:5
+        dvf_small = zeros([small_size, 3], 'single');
+        for c = 1:3
+            dvf_small(:,:,:,c) = imresize3(DVFs{i}(:,:,:,c), small_size, 'linear');
+        end
+        V_train_sampled(i, :) = dvf_small(:);
+    end
+    mean_V = mean(V_train_sampled, 1);
+    [coeff_V, score_V, latent_V] = pca(V_train_sampled, 'Economy', true);
+    Y_dvf = score_V(:, 1:k_feat);
+    
+    Z_train = Z_surf; 
+    Y_train = Y_dvf;
+    H = Z_train' * Z_train; 
+    scale_H = max(abs(H(:))); 
+    if scale_H < 1e-6, scale_H = 1; end
     
     W_base = (H + 1e-5 * scale_H * eye(k_feat)) \ (Z_train' * Y_train);
     
@@ -123,8 +148,9 @@ for case_id = 1:10
     penalty_diag(1) = 0;
     W_pide = (H + alpha_physics * scale_H * diag(penalty_diag)) \ (Z_train' * Y_train);
     
-    % 噪声注入与测试
-    Z_test_clean = Z_surf(6, :); 
+    % 测试 Phase 6 (潜空间高频噪声)
+    Z_test_clean = (reshape(depth_maps(:,:,6), 1, []) - mean_depth) * coeff_S;
+    Z_test_clean = Z_test_clean(1:k_feat);
     rng(case_id); 
     noise = randn(1, k_feat) .* std(Z_train) .* [0.1, 2.0, 5.0]; 
     Z_test_noisy = Z_test_clean + noise;
@@ -133,10 +159,15 @@ for case_id = 1:10
     Y_pred_pide = Z_test_noisy * W_pide;
     
     % 重建与 TRE 计算
-    dvf_base_vec = mean_V + Y_pred_base * coeff_V(:, 1:k_feat)';
-    dvf_pide_vec = mean_V + Y_pred_pide * coeff_V(:, 1:k_feat)';
-    DVF_base = reshape(dvf_base_vec, [img_size, 3]);
-    DVF_pide = reshape(dvf_pide_vec, [img_size, 3]);
+    dvf_base_small = reshape(mean_V + Y_pred_base * coeff_V(:, 1:k_feat)', [small_size, 3]);
+    dvf_pide_small = reshape(mean_V + Y_pred_pide * coeff_V(:, 1:k_feat)', [small_size, 3]);
+    
+    DVF_base = zeros([img_size, 3], 'single');
+    DVF_pide = zeros([img_size, 3], 'single');
+    for c = 1:3
+        DVF_base(:,:,:,c) = imresize3(dvf_base_small(:,:,:,c), img_size, 'linear');
+        DVF_pide(:,:,:,c) = imresize3(dvf_pide_small(:,:,:,c), img_size, 'linear');
+    end
     
     [Xm, Ym, Zm] = meshgrid(1:img_size(2), 1:img_size(1), 1:img_size(3));
     
@@ -172,7 +203,7 @@ end
 
 %% 终极大汇总与可视化
 fprintf('\n==================================================\n');
-fprintf('最终战报：全队列 10 例患者 (总计 3000 标志点)\n');
+fprintf('最终战报 (Data Leakage Fixed)\n');
 fprintf('  平均初始误差 : %.2f ± %.2f mm\n', mean(all_initial_err), std(all_initial_err));
 fprintf('  OLS TRE      : %.2f ± %.2f mm\n', mean(all_base_err), std(all_base_err));
 fprintf('  PIDE TRE     : %.2f ± %.2f mm (改善 %.1f%%)\n', ...
@@ -180,17 +211,15 @@ fprintf('  PIDE TRE     : %.2f ± %.2f mm (改善 %.1f%%)\n', ...
     (mean(all_base_err)-mean(all_pide_err))/mean(all_base_err)*100);
 fprintf('==================================================\n');
 
-% 统计显著性
 [~, p_val] = ttest(all_pide_err, all_base_err);
 fprintf('  配对 t-test: p = %.2e\n', p_val);
 
-% 临床成功率
 success_ols = mean(all_base_err < 2.0) * 100;
 success_pide = mean(all_pide_err < 2.0) * 100;
 fprintf('  临床成功率 (TRE < 2mm): OLS = %.1f%%, PIDE = %.1f%%\n', success_ols, success_pide);
 fprintf('==================================================\n');
 
-% 生成 Figure 2 (箱线图)
+% 生成 Figure 2
 fig1 = figure('Color', 'w', 'Position', [100, 100, 550, 500]);
 boxplot([all_initial_err, all_base_err, all_pide_err], ...
     'Labels', {'Initial', 'OLS', 'PIDE'}, ...
@@ -202,7 +231,6 @@ yline(2.0, 'r--', 'Clinical Threshold (2mm)', 'LineWidth', 1.5);
 ylim([0, max([mean(all_base_err)+2*std(all_base_err), 10])]);
 set(gca, 'FontSize', 11);
 exportgraphics(fig1, fullfile(main_path, 'Figure2_TRE.png'), 'Resolution', 300);
-exportgraphics(fig1, fullfile(main_path, 'Figure2_TRE.pdf'), 'ContentType', 'vector');
 fprintf('✅ Figure 2 已保存\n');
 
 %% 辅助函数
