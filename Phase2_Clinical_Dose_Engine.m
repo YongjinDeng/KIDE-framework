@@ -1,5 +1,5 @@
 %% ========================================================================
-%  Phase 2: Heterogeneity-Aware Dose Engine (完美复原您的原始经典结果)
+%  Phase 2: Heterogeneity-Aware Dose Engine
 %  新增: 全局等距 Dose Map 排版、V20 肺部毒性指标、60Gy等剂量线
 % =========================================================================
 clear; clc; close all;
