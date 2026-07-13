@@ -1,6 +1,6 @@
 %% ========================================================================
-%  Phase 2: Heterogeneity-Aware Dose Engine (最终完美版)
-%  新增: 文件鲁棒性检索、全局等距 Dose Map 排版、V20 肺部毒性指标、60Gy等剂量线
+%  Phase 2: Heterogeneity-Aware Dose Engine (完美复原您的原始经典结果)
+%  新增: 全局等距 Dose Map 排版、V20 肺部毒性指标、60Gy等剂量线
 % =========================================================================
 clear; clc; close all;
 
@@ -21,7 +21,7 @@ for case_id = target_cases
     load(processed_file, 'depth_maps', 'DVFs'); 
     dvf_gt_raw = DVFs{6};
     
-    % --- 【修复】极度鲁棒的文件搜索 ---
+    % --- 极度鲁棒的文件搜索 ---
     img_files = dir(fullfile(case_path, 'Images', '*T00*.img'));
     if isempty(img_files)
         fprintf('  ⚠️ CT图像不存在，跳过\n'); continue;
@@ -62,8 +62,12 @@ for case_id = target_cases
     plan_dose = presc_dose ./ (1 + exp(steepness * (eff_dist - (ptv_radius + margin))));
     plan_dose(plan_dose > presc_dose) = presc_dose;
     
-    % --- 模拟遮挡预测 ---
-    D_mat = reshape(depth_maps, [], 10)'; [coeff_S, score_S, ~] = pca(D_mat, 'Economy', true); Z_surf = score_S(:, 1:3);
+    % =========================================================================
+    % 核心算法还原：完全使用您的原始经典逻辑 (全周期 10 相 PCA)
+    % =========================================================================
+    D_mat = reshape(depth_maps, [], 10)'; 
+    [coeff_S, score_S, ~] = pca(D_mat, 'Economy', true); 
+    Z_surf = score_S(:, 1:3);
     
     if prod(img_size) > 1e6, scale_factor = 0.5; else, scale_factor = 1.0; end
     small_size = max(floor(img_size * scale_factor), [1, 1, 1]);
@@ -74,14 +78,18 @@ for case_id = target_cases
         for c = 1:3, dvf_s(:,:,:,c) = imresize3(DVFs{i}(:,:,:,c), small_size, 'linear'); end
         V_mat_sampled(i, :) = dvf_s(:);
     end
-    [coeff_V, score_V, latent_V] = pca(V_mat_sampled, 'Economy', true); Y_dvf = score_V(:, 1:3); mean_V = mean(V_mat_sampled, 1);
+    [coeff_V, score_V, latent_V] = pca(V_mat_sampled, 'Economy', true); 
+    Y_dvf = score_V(:, 1:3); 
+    mean_V = mean(V_mat_sampled, 1);
     
-    Z_train = Z_surf(1:5, :); Y_train = Y_dvf(1:5, :); H = Z_train'*Z_train; scale_H = max(abs(H(:))); if scale_H<1e-6, scale_H=1; end
+    Z_train = Z_surf(1:5, :); Y_train = Y_dvf(1:5, :); 
+    H = Z_train'*Z_train; scale_H = max(abs(H(:))); if scale_H<1e-6, scale_H=1; end
     W_ols = (H + 1e-6*scale_H*eye(3)) \ (Z_train'*Y_train);
+    
     penalty_diag = 1 ./ (latent_V(1:3) / max(latent_V(1:3)) + 1e-4); penalty_diag(1) = 0;
     W_kide = (H + 5.0*scale_H*diag(penalty_diag)) \ (Z_train'*Y_train);
     
-    % 安全噪声注入
+    % 安全噪声注入 (保留您最初的写法)
     rng(case_id); 
     clean_depth = depth_maps(:,:,6);
     noisy_depth = clean_depth + imgaussfilt(randn(size(clean_depth)), 2.0) * 5.0;
@@ -89,14 +97,20 @@ for case_id = target_cases
     r_idx = max(1, cx - occ_w) : min(r, cx + occ_w); c_idx = max(1, cy - occ_w) : min(c, cy + occ_w);
     noisy_depth(r_idx, c_idx) = noisy_depth(r_idx, c_idx) + 150.0;
     
-    Z_test_noisy = ((noisy_depth(:)' - mean(reshape(depth_maps(:,:,1:5), [], 5)', 1)) * coeff_S); Z_test_noisy = Z_test_noisy(1:3);
+    Z_test_noisy = ((noisy_depth(:)' - mean(reshape(depth_maps(:,:,1:5), [], 5)', 1)) * coeff_S); 
+    Z_test_noisy = Z_test_noisy(1:3);
     
-    Y_ols = Z_test_noisy * W_ols; Y_kide = Z_test_noisy * W_kide;
-    dvf_ols_s = reshape(mean_V + Y_ols * coeff_V(:, 1:3)', [small_size, 3]); dvf_kide_s = reshape(mean_V + Y_kide * coeff_V(:, 1:3)', [small_size, 3]);
+    Y_ols = Z_test_noisy * W_ols; 
+    Y_kide = Z_test_noisy * W_kide;
+    
+    dvf_ols_s = reshape(mean_V + Y_ols * coeff_V(:, 1:3)', [small_size, 3]); 
+    dvf_kide_s = reshape(mean_V + Y_kide * coeff_V(:, 1:3)', [small_size, 3]);
     dvf_ols = zeros([img_size, 3], 'single'); dvf_kide = zeros([img_size, 3], 'single');
     for ch = 1:3
-        dvf_ols(:,:,:,ch) = imresize3(dvf_ols_s(:,:,:,ch), img_size, 'linear'); dvf_kide(:,:,:,ch) = imresize3(dvf_kide_s(:,:,:,ch), img_size, 'linear');
+        dvf_ols(:,:,:,ch) = imresize3(dvf_ols_s(:,:,:,ch), img_size, 'linear'); 
+        dvf_kide(:,:,:,ch) = imresize3(dvf_kide_s(:,:,:,ch), img_size, 'linear');
     end
+    % =========================================================================
     
     % --- 提取动态剂量 ---
     warp_dose = @(DVF) interp3(X, Y, Z, plan_dose, X + DVF(:,:,:,1)/voxel_spacing(1), Y + DVF(:,:,:,2)/voxel_spacing(2), Z + DVF(:,:,:,3)/voxel_spacing(3), 'linear', 0);
@@ -146,7 +160,7 @@ for case_id = target_cases
     contour(ptv_c, 1, 'r-', 'LineWidth', 1.5);
     title(sprintf('KIDE (Ours)\nD95: %.1f Gy', calc_D95(dose_kide)), 'FontSize', 14);
     
-    % 【魔法】添加统一的独立 Colorbar，确保四个子图绝对等宽
+    % 添加统一的独立 Colorbar
     cb = colorbar('Position', [0.93, 0.15, 0.015, 0.7]);
     cb.Label.String = 'Dose (Gy)';
     cb.Label.FontSize = 12;
