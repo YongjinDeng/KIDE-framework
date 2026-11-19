@@ -5,14 +5,16 @@
 % =========================================================================
 clear; clc; close all;
 
-main_path   = 'C:\D盘数据转移\data四维剂量重建\DIR-Lab\';
-result_path = 'D:\0临床科研\四维剂量重建(给喜雪改投版本)\result\';
+main_path   = 'E:\D盘数据转移\data四维剂量重建\DIR-Lab\';
+result_path = 'D:\0临床科研\四维剂量重建(给喜雪改投版本)\result\R2\';
 if ~exist(result_path, 'dir'), mkdir(result_path); end
+[alpha_kide,kappa] = R2_LoadParameters(result_path);
 
 target_cases = [1, 5, 8];
+dose_rows = [];
 
 fprintf('====================================================================\n');
-fprintf('Heterogeneity-Aware Dosimetric Evaluation (Fully Aligned Physics V3)\n');
+fprintf('Heterogeneity-Aware Dosimetric Surrogate (R2)\n');
 fprintf('====================================================================\n');
 
 for case_id = target_cases
@@ -22,15 +24,15 @@ for case_id = target_cases
     [img_size, voxel_spacing] = get_dirlab_params(case_id);
 
     processed_file = fullfile(case_path, 'Processed', sprintf('Case%d_DVF_Depth.mat', case_id));
-    if ~exist(processed_file, 'file'), continue; end
+    assert(isfile(processed_file),'Missing cache %s',processed_file);
     load(processed_file, 'depth_maps', 'DVFs', 'pts_T00', 'pts_T50');
-    dvf_gt_raw = DVFs{6}; % T50 金标准 DVF
+    dvf_gt_raw = DVFs{6}; % T50 Demons reference DVF
 
     % ---------------------------------------------------------------------
     % 读取参考相 CT 并统一转为标准矩阵坐标系 [N_rows, N_cols, N_slices]
     % ---------------------------------------------------------------------
     img_files = dir(fullfile(case_path, 'Images', '*T00*.img'));
-    if isempty(img_files), continue; end
+    assert(~isempty(img_files),'Missing T00 CT');
     fid = fopen(fullfile(img_files(1).folder, img_files(1).name), 'r');
     img_raw = reshape(fread(fid, prod(img_size), 'int16'), img_size);
     fclose(fid);
@@ -102,28 +104,19 @@ for case_id = target_cases
 
     W_ols = (H_mat + 1e-6 * scale_H * eye(3)) \ (Z_train' * Y_train);
 
-    % 黄金软谱阻尼配置 (kappa=0.25, alpha=5.0)
-    kappa = 0.25;
+    % 训练集交叉验证软谱参数
+    % R2: kappa selected using training-only CV.
     max_L = max(latent_V(1:3));
     penalty_diag = (max_L - latent_V(1:3)) ./ (latent_V(1:3) + kappa * max_L + 1e-6);
     penalty_diag(1) = 0;
-    alpha_kide = 5.0;
+    % R2: alpha selected using training-only CV.
     W_kide = (H_mat + alpha_kide * scale_H * diag(penalty_diag)) \ (Z_train' * Y_train);
 
     % ---------------------------------------------------------------------
     % 3. 注入临床真实视场遮挡 (80 x 60 mm^2)
     % ---------------------------------------------------------------------
     clean_depth = depth_maps(:,:,6);
-    rng(case_id + 100);
-    noisy_depth = clean_depth + randn(size(clean_depth)) * 2.0;
-
-    [nrows, ncols] = size(clean_depth);
-    patch_h = round(80.0 / voxel_spacing(1)); 
-    patch_w = round(60.0 / voxel_spacing(3));
-    c_x = round(nrows * 0.5); c_y = round(ncols * 0.5);
-    r_idx = max(1, c_x - patch_h) : min(nrows, c_x + patch_h);
-    c_idx = max(1, c_y - patch_w) : min(ncols, c_y + patch_w);
-    noisy_depth(r_idx, c_idx) = noisy_depth(r_idx, c_idx) + 80.0;
+    noisy_depth = R2_PerturbDepth(clean_depth,voxel_spacing,case_id+100);
 
     Z_test_noisy = (noisy_depth(:)' - mean_depth) * coeff_S;
     Z_test_noisy = Z_test_noisy(1:3);
@@ -146,9 +139,9 @@ for case_id = target_cases
     % ---------------------------------------------------------------------
     % DVF: 通道 1 沿 X (列), 通道 2 沿 Y (行), 通道 3 沿 Z (切片)
     warp_dose = @(DVF) interp3(X, Y, Z, plan_dose, ...
-        X + double(DVF(:,:,:,1)) / voxel_spacing(1), ...
-        Y + double(DVF(:,:,:,2)) / voxel_spacing(2), ...
-        Z + double(DVF(:,:,:,3)) / voxel_spacing(3), 'linear', 0);
+        X + double(DVF(:,:,:,1)), ...
+        Y + double(DVF(:,:,:,2)), ...
+        Z + double(DVF(:,:,:,3)), 'linear', 0);
 
     dose_gt   = warp_dose(dvf_gt_raw);
     dose_ols  = warp_dose(dvf_ols);
@@ -163,15 +156,21 @@ for case_id = target_cases
     gamma_22_ols  = compute_gamma_3d(dose_ols,  dose_gt, ptv_mask, 2.0, 1.24, voxel_spacing);
     gamma_22_kide = compute_gamma_3d(dose_kide, dose_gt, ptv_mask, 2.0, 1.24, voxel_spacing);
 
-    fprintf('  D95%% (覆盖指标) : Plan=%.1f | GT(True)=%.1f | OLS=%.1f | KIDE=%.1f Gy\n', ...
+    fprintf('  D95%% (覆盖指标) : Plan=%.1f | Demons Ref=%.1f | OLS=%.1f | KIDE=%.1f Gy\n', ...
         calc_D95(plan_dose), calc_D95(dose_gt), calc_D95(dose_ols), calc_D95(dose_kide));
-    fprintf('  D98%% (极值覆盖) : Plan=%.1f | GT(True)=%.1f | OLS=%.1f | KIDE=%.1f Gy\n', ...
+    fprintf('  D98%% (极值覆盖) : Plan=%.1f | Demons Ref=%.1f | OLS=%.1f | KIDE=%.1f Gy\n', ...
         calc_D98(plan_dose), calc_D98(dose_gt), calc_D98(dose_ols), calc_D98(dose_kide));
-    fprintf('  V20  (肺部毒性) : Plan=%.1f%% | GT(True)=%.1f%% | OLS=%.1f%% | KIDE=%.1f%%\n', ...
+    fprintf('  V20  (肺部毒性) : Plan=%.1f%% | Demons Ref=%.1f%% | OLS=%.1f%% | KIDE=%.1f%%\n', ...
         calc_V20(plan_dose), calc_V20(dose_gt), calc_V20(dose_ols), calc_V20(dose_kide));
     fprintf('  Gamma 3mm/3%%    : OLS = %5.1f%% | KIDE = %5.1f%%\n', gamma_33_ols, gamma_33_kide);
     fprintf('  Gamma 2mm/2%%    : OLS = %5.1f%% | KIDE = %5.1f%%\n', gamma_22_ols, gamma_22_kide);
 
+    % Preserve per-case numerical endpoints for the manuscript.
+    maps={plan_dose,dose_gt,dose_ols,dose_kide};
+    for m=1:4
+        dose_rows=[dose_rows; case_id,m,motion_3d(rep_idx),calc_D95(maps{m}),calc_D98(maps{m}),calc_V20(maps{m}),NaN,NaN]; %#ok<AGROW>
+    end
+    dose_rows(end-3:end,7:8)=[NaN NaN;NaN NaN;gamma_33_ols gamma_22_ols;gamma_33_kide gamma_22_kide];
     % ---------------------------------------------------------------------
     % 5. Figure 3: Dose Map (标准横断位: 胸前壁在上，脊柱后壁在下)
     % ---------------------------------------------------------------------
@@ -196,7 +195,7 @@ for case_id = target_cases
     end
     title('CT & Target (PTV)', 'FontSize', 12, 'FontWeight', 'bold');
 
-    % Subplot 2: Ground Truth
+    % Subplot 2: Demons Reference
     subplot(1,4,2); 
     d_gt_c = orient_func(dose_gt(:,:,slice_z));
     imagesc(1:W_img, 1:H_img, d_gt_c); colormap(gca, 'jet'); clim([0 62]); 
@@ -207,7 +206,7 @@ for case_id = target_cases
     if any(ptv_c(:))
         contour(1:W_img, 1:H_img, ptv_c, [0.5 0.5], 'r-', 'LineWidth', 1.5); 
     end
-    title(sprintf('Ground Truth\nD95: %.1f Gy', calc_D95(dose_gt)), 'FontSize', 12);
+    title(sprintf('Demons Reference\nD95: %.1f Gy', calc_D95(dose_gt)), 'FontSize', 12);
 
     % Subplot 3: OLS Baseline
     subplot(1,4,3); 
@@ -253,11 +252,15 @@ for case_id = target_cases
     xlabel('Dose (Gy)', 'FontSize', 12, 'FontWeight', 'bold');
     ylabel('Target Volume (%)', 'FontSize', 12, 'FontWeight', 'bold');
     title(sprintf('Case %d: PTV Dose-Volume Histogram', case_id), 'FontSize', 13);
-    legend('Static Plan', 'Ground Truth', 'OLS (Baseline)', 'KIDE (Ours)', 'Location', 'southwest', 'FontSize', 10);
+    legend('Static Plan', 'Demons Reference', 'OLS (Baseline)', 'KIDE (Ours)', 'Location', 'southwest', 'FontSize', 10);
     grid on; axis([0 70 0 105]);
     exportgraphics(fig4, fullfile(result_path, sprintf('Figure4_Case%d_DVH_Fixed.png', case_id)), 'Resolution', 300);
     fprintf('  ✅ Case %02d 剂量图与 DVH 保存成功 (几何完全同轴对齐)。\n', case_id);
+    clear maps X Y Z dose_gt dose_ols dose_kide plan_dose DVFs dvf_gt_raw dvf_ols dvf_kide V_train_sampled coeff_V;
 end
+T=array2table(dose_rows,'VariableNames',{'Case','ModelID','TargetExcursion_mm','D95_Gy','D98_Gy','V20_pct','Gamma33_pct','Gamma22_pct'});
+names=["Plan";"Demons reference";"OLS";"KIDE"]; T.Model=names(T.ModelID);
+writetable(T,fullfile(result_path,'R2_Dosimetry.csv'));
 
 %% ========================================================================
 %  快速 3D Gamma 指标计算
