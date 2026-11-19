@@ -1,22 +1,25 @@
 %% ========================================================================
 %  File: Run_Complete_Geometric_Validation.m
-%  Description: 几何验证主脚本 (终极定稿版: 真实在线控制闭环计时 + 黄金谱先验)
+%  Description: 几何验证主脚本 (终极定稿版: 真实在线控制闭环计时 + 训练集交叉验证谱先验)
 %  Journal: Journal of Applied Clinical Medical Physics (JACMP)
 % =========================================================================
 clear; clc; close all;
 
-main_path   = 'C:\D盘数据转移\data四维剂量重建\DIR-Lab\';
-result_path = 'D:\0临床科研\四维剂量重建(给喜雪改投版本)\result\';
+main_path   = 'E:\D盘数据转移\data四维剂量重建\DIR-Lab\';
+result_path = 'D:\0临床科研\四维剂量重建(给喜雪改投版本)\result\R2\';
 if ~exist(result_path, 'dir'), mkdir(result_path); end
+[alpha_kide,kappa] = R2_LoadParameters(result_path);
 
 all_err = struct('Initial', [], 'OLS', [], 'PLS', [], 'KRR', [], 'KIDE', []);
 all_jac = struct('Demons_Ref', [], 'OLS', [], 'PLS', [], 'KRR', [], 'KIDE', []);
 online_tracking_latencies = [];
 recon_3d_latencies       = [];
+patient_means = nan(10,5); patient_p95 = nan(10,5); patient_success = nan(10,5);
+patch_info = nan(10,7);
 
 fprintf('====================================================================\n');
-fprintf('  Rigorous Validation: 10 DIR-Lab Cases under Realistic SGRT Noise\n');
-fprintf('  (Protocol: Strict 5-Phase Training [T00-T40] | Gold Soft Spectral Prior)\n');
+fprintf('  Rigorous Validation: 10 DIR-Lab Cases under Simulated SGRT Stress Test\n');
+fprintf('  (Protocol: Strict 5-Phase Training [T00-T40] | Training-only CV parameters)\n');
 fprintf('====================================================================\n');
 
 for case_id = 1:10
@@ -56,7 +59,7 @@ for case_id = 1:10
     Y_train = score_V(1:5, 1:k_feat);
 
     % ---------------------------------------------------------------------
-    % 2. 模型训练：锁定黄金最优解 (kappa=0.25, alpha=5.0)
+    % 2. 模型训练：训练集交叉验证参数
     % ---------------------------------------------------------------------
     H = Z_train' * Z_train;
     scale_factor_H = max(abs(H(:)));
@@ -78,51 +81,37 @@ for case_id = 1:10
     lambda_krr = 1e-2;
     alpha_krr = (K_train + lambda_krr * eye(5)) \ Y_train;
 
-    % D. 本文 KIDE: 坚固的自适应软谱阻尼黄金解
-    kappa = 0.25;
+    % D. 本文 KIDE: 自适应软谱阻尼
+    % R2: kappa selected using training-only CV.
     max_L = max(latent_V(1:k_feat));
     penalty_diag = (max_L - latent_V(1:k_feat)) ./ (latent_V(1:k_feat) + kappa * max_L + 1e-6);
     penalty_diag(1) = 0; % 绝对保护主潮气量 PC1
-    alpha_kide = 5.0;    % 经网格搜索证实的黄金最优值
+    % R2: alpha selected using training-only CV.
     W_kide = (H + alpha_kide * scale_factor_H * diag(penalty_diag)) \ (Z_train' * Y_train);
 
     % ---------------------------------------------------------------------
     % 3. 临床真实 SGRT 物理遮挡 (统一规范为 80 x 60 mm^2)
     % ---------------------------------------------------------------------
     clean_depth_T50 = depth_maps(:,:,6);
-    rng(case_id + 100);
-
-    sensor_noise = randn(size(clean_depth_T50)) * 2.0;
-    noisy_depth = clean_depth_T50 + sensor_noise;
-
-    [nrows, ncols] = size(clean_depth_T50);
-    patch_h = round(80.0 / voxel_spacing(1)); % 80 mm 宽度
-    patch_w = round(60.0 / voxel_spacing(3)); % 60 mm 纵向
-    c_x = round(nrows * 0.5);
-    c_y = round(ncols * 0.5);
-    r_idx = max(1, c_x - patch_h) : min(nrows, c_x + patch_h);
-    c_idx = max(1, c_y - patch_w) : min(ncols, c_y + patch_w);
-    noisy_depth(r_idx, c_idx) = noisy_depth(r_idx, c_idx) + 80.0;
+    [noisy_depth,~,patch_info(case_id,:)] = R2_PerturbDepth(clean_depth_T50,voxel_spacing,case_id+100);
 
     Z_test_noisy = (noisy_depth(:)' - mean_depth) * coeff_S;
     Z_test_noisy = Z_test_noisy(1:k_feat);
 
     % ---------------------------------------------------------------------
-    % 4. 严谨的放疗真实在线控制闭环延迟测量 (特征投影 + 映射 + 稀疏重构)
+    % 4. 算法耗时测量：已准备深度图至稀疏坐标 (特征投影 + 映射 + 稀疏重构)
     % ---------------------------------------------------------------------
-    pts_idx = sub2ind(small_size, min(max(round(pts_T00(:,2)*scale_factor),1),small_size(1)), ...
-                                  min(max(round(pts_T00(:,1)*scale_factor),1),small_size(2)), ...
-                                  min(max(round(pts_T00(:,3)*scale_factor),1),small_size(3)));
-    basis_sparse = coeff_V(pts_idx, 1:k_feat);
-
-    % 预热并测试完整的在线控制循环
-    dummy = imresize3(zeros(small_size, 'single'), img_size, 'linear'); clear dummy;
+    [basis_sparse, mean_sparse] = R2_SparseLandmarkBasis(coeff_V(:,1:k_feat),mean_V,small_size,img_size,pts_T00);
+    % Offline basis preparation excluded. Ready-to-use depth map is input.
     n_loop = 100;
+    z_curr = (noisy_depth(:)' - mean_depth) * coeff_S(:,1:k_feat);
+    y_curr = z_curr * W_kide;
+    target_xyz = pts_T00 + reshape(mean_sparse + basis_sparse*double(y_curr'),[],3);
     tic;
     for rep = 1:n_loop
-        z_curr = (noisy_depth(:)' - mean_depth) * coeff_S(:, 1:k_feat);
+        z_curr = (noisy_depth(:)' - mean_depth) * coeff_S(:,1:k_feat);
         y_curr = z_curr * W_kide;
-        disp_sparse = basis_sparse * y_curr';
+        target_xyz = pts_T00 + reshape(mean_sparse + basis_sparse*double(y_curr'),[],3);
     end
     t_online = (toc / n_loop) * 1000; % ms
     online_tracking_latencies = [online_tracking_latencies; t_online];
@@ -161,22 +150,31 @@ for case_id = 1:10
     % ---------------------------------------------------------------------
     % 5. 几何精度与拓扑评估
     % ---------------------------------------------------------------------
-    [Xm, Ym, Zm] = meshgrid(1:img_size(2), 1:img_size(1), 1:img_size(3));
     err_init = sqrt(sum(((pts_T50 - pts_T00) .* voxel_spacing).^2, 2));
-    err_ols  = compute_tre(dvf_ols,  pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
-    err_pls  = compute_tre(dvf_pls,  pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
-    err_krr  = compute_tre(dvf_krr,  pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
-    err_kide = compute_tre(dvf_kide, pts_T00, pts_T50, voxel_spacing, Xm, Ym, Zm);
+    err_ols  = compute_tre(dvf_ols,  pts_T00, pts_T50, voxel_spacing);
+    err_pls  = compute_tre(dvf_pls,  pts_T00, pts_T50, voxel_spacing);
+    err_krr  = compute_tre(dvf_krr,  pts_T00, pts_T50, voxel_spacing);
+    err_kide = compute_tre(dvf_kide, pts_T00, pts_T50, voxel_spacing);
 
-    scaled_vs = voxel_spacing .* (img_size ./ small_size);
+    % DVF amplitudes remain in original-grid voxel units.
     dvf_demons_ref_small = zeros([small_size, 3], 'single');
     for ch = 1:3, dvf_demons_ref_small(:,:,:,ch) = imresize3(DVFs{6}(:,:,:,ch), small_size, 'linear'); end
-    jac_ref  = calculate_jacobian_folding(dvf_demons_ref_small, scaled_vs);
-    jac_ols  = calculate_jacobian_folding(dvf_ols_small, scaled_vs);
-    jac_pls  = calculate_jacobian_folding(dvf_pls_small, scaled_vs);
-    jac_krr  = calculate_jacobian_folding(dvf_krr_small, scaled_vs);
-    jac_kide = calculate_jacobian_folding(dvf_kide_small, scaled_vs);
+    jac_ref  = R2_JacobianFolding(dvf_demons_ref_small, voxel_spacing, img_size);
+    jac_ols  = R2_JacobianFolding(dvf_ols_small, voxel_spacing, img_size);
+    jac_pls  = R2_JacobianFolding(dvf_pls_small, voxel_spacing, img_size);
+    jac_krr  = R2_JacobianFolding(dvf_krr_small, voxel_spacing, img_size);
+    jac_kide = R2_JacobianFolding(dvf_kide_small, voxel_spacing, img_size);
 
+    % Validate timed sparse prediction against the same dense interpolation.
+    dense_xyz=pts_T00+[interp3(double(dvf_kide(:,:,:,1)),pts_T00(:,1),pts_T00(:,2),pts_T00(:,3),'linear',0), ...
+        interp3(double(dvf_kide(:,:,:,2)),pts_T00(:,1),pts_T00(:,2),pts_T00(:,3),'linear',0), ...
+        interp3(double(dvf_kide(:,:,:,3)),pts_T00(:,1),pts_T00(:,2),pts_T00(:,3),'linear',0)];
+    assert(max(abs(target_xyz(:)-dense_xyz(:)))<1e-3,'Sparse/dense mismatch');
+    E=[err_init,err_ols,err_pls,err_krr,err_kide];
+    assert(size(E,1)==300 && all(isfinite(E(:))),'Invalid landmark results');
+    patient_means(case_id,:)=mean(E,1);
+    patient_p95(case_id,:)=prctile(E,95,1);
+    patient_success(case_id,:)=100*mean(E<2,1);
     all_err.Initial = [all_err.Initial; err_init];
     all_err.OLS     = [all_err.OLS; err_ols];
     all_err.PLS     = [all_err.PLS; err_pls];
@@ -191,6 +189,7 @@ for case_id = 1:10
 
     fprintf('  Case %02d | Init: %5.2f | OLS: %5.2f | PLS: %5.2f | KRR: %5.2f | KIDE: %5.2f mm\n', ...
         case_id, mean(err_init), mean(err_ols), mean(err_pls), mean(err_krr), mean(err_kide));
+    clear DVFs V_train_sampled coeff_V dvf_ols dvf_pls dvf_krr dvf_kide;
 end
 
 %% ========================================================================
@@ -213,23 +212,35 @@ for m = 1:length(models)
             name, mean(e), std(e), prc95, succ, mean(all_jac.(name)));
     end
 end
+summary_rows=nan(5,5);
+for j=1:5
+    e=all_err.(models{j}); summary_rows(j,1:4)=[mean(e),std(e),prctile(e,95),100*mean(e<2)];
+    if j>1, summary_rows(j,5)=mean(all_jac.(models{j})); end
+end
+T=array2table(summary_rows,'VariableNames',{'MeanTRE_mm','LandmarkSD_mm','P95TRE_mm','Success2mm_pct','MeanFolding_pct'});
+T.Model=string(models(:)); writetable(T,fullfile(result_path,'R2_CohortTRE.csv'));
 fprintf('  Demons Ref  : 4DCT Reference Jacobian Folding = %5.2f%%\n', mean(all_jac.Demons_Ref));
 fprintf('--------------------------------------------------------------------\n');
 
-[~, p_ols] = ttest(all_err.KIDE, all_err.OLS);
-[~, p_pls] = ttest(all_err.KIDE, all_err.PLS);
-[~, p_krr] = ttest(all_err.KIDE, all_err.KRR);
-
-fprintf('  Statistical Significance (Paired two-tailed t-test, n=3000):\n');
-fprintf('    KIDE vs OLS : %s (raw: %.2e)\n', format_p_val(p_ols), p_ols);
-fprintf('    KIDE vs PLS : %s (raw: %.2e)\n', format_p_val(p_pls), p_pls);
-fprintf('    KIDE vs KRR : %s (raw: %.2e)\n', format_p_val(p_krr), p_krr);
-fprintf('--------------------------------------------------------------------\n');
-fprintf('  Computational Latency Profiling (Clinical SGRT Pipeline):\n');
-fprintf('    Real-Time Online Tracking Latency : %6.3f ± %6.3f ms  (Update Rate: ~%d Hz)\n', ...
-    mean(online_tracking_latencies), std(online_tracking_latencies), round(1000/mean(online_tracking_latencies)));
-fprintf('    Dense 3D Grid Reconstruction      : %6.1f ± %6.1f ms  (CPU MATLAB, Post-Processing)\n', ...
-    mean(recon_3d_latencies), std(recon_3d_latencies));
+% Patients, not correlated landmarks, are the inferential units.
+comparators={'OLS';'PLS';'KRR'}; delta=patient_means(:,2:4)-patient_means(:,5);
+p_raw=zeros(3,1); ci=zeros(3,2);
+for j=1:3
+    [~,p_raw(j),CI]=ttest(delta(:,j)); ci(j,:)=CI(:)';
+end
+[p_sort,ord]=sort(p_raw); p_holm=zeros(3,1);
+p_holm(ord)=min(1,cummax((3:-1:1)'.*p_sort));
+stats=table(comparators,mean(delta,1)',ci(:,1),ci(:,2),p_raw,p_holm,sum(delta>0,1)', ...
+    'VariableNames',{'Comparator','MeanBenefit_mm','CI95_Lower','CI95_Upper','P_raw','P_Holm','CasesKIDEbetter'});
+disp(stats); writetable(stats,fullfile(result_path,'R2_PatientStats.csv'));
+T=array2table([(1:10)',patient_means,patient_p95,patient_success], 'VariableNames', ...
+    {'Case','Initial_mean','OLS_mean','PLS_mean','KRR_mean','KIDE_mean','Initial_p95','OLS_p95','PLS_p95','KRR_p95','KIDE_p95', ...
+    'Initial_success','OLS_success','PLS_success','KRR_success','KIDE_success'});
+writetable(T,fullfile(result_path,'R2_PatientTRE.csv'));
+T=array2table([(1:10)',online_tracking_latencies,recon_3d_latencies], 'VariableNames',{'Case','Algorithm_ms','DenseReconstruction_ms'});
+writetable(T,fullfile(result_path,'R2_Timing.csv'));
+fprintf('  Algorithm processing (ready depth map -> 300 xyz coordinates): %.3f +/- %.3f ms\n',mean(online_tracking_latencies),std(online_tracking_latencies));
+fprintf('  Dense grid reconstruction: %.1f +/- %.1f ms\n',mean(recon_3d_latencies),std(recon_3d_latencies));
 fprintf('====================================================================\n');
 
 fig2 = figure('Color', 'w', 'Position', [100, 100, 750, 500]);
@@ -239,33 +250,18 @@ boxplot(data_matrix, 'Labels', {'No Tracking', 'OLS', 'PLS', 'KRR', 'KIDE (Ours)
 ylabel('Target Registration Error (mm)', 'FontSize', 12, 'FontWeight', 'bold');
 title('Surface-to-Internal Tracking Robustness (10 Cases, n=3,000 Landmarks)', 'FontSize', 13, 'FontWeight', 'bold');
 grid on; hold on;
-yline(2.0, 'r--', 'Clinical Acceptance Threshold (2 mm)', 'LineWidth', 1.5);
-ylim([0, 25]);
+yline(2.0, 'r--', 'Descriptive 2 mm threshold', 'LineWidth', 1.5);
+ylim([0, max(25,ceil(max(data_matrix(:))))]);
 set(gca, 'FontSize', 11, 'LineWidth', 1.1);
 exportgraphics(fig2, fullfile(result_path, 'Figure2_TRE_Enhanced_Baselines.png'), 'Resolution', 300);
 
-save(fullfile(result_path, 'Enhanced_KIDE_Results.mat'), 'all_err', 'all_jac', 'online_tracking_latencies', 'recon_3d_latencies');
+save(fullfile(result_path, 'Enhanced_KIDE_Results.mat'), 'all_err', 'all_jac', 'online_tracking_latencies', 'recon_3d_latencies','patient_means','patient_p95','patient_success','patch_info','stats','alpha_kide','kappa');
 fprintf('✅ Figure 2 与最终数值矩阵已保存至: %s\n', result_path);
 
-function str = format_p_val(p)
-    if p < 0.001, str = 'p < 0.001'; else, str = sprintf('p = %.3f', p); end
-end
-
-function jac_fold = calculate_jacobian_folding(DVF, vs)
-    [du1_dy, du1_dx, du1_dz] = gradient(DVF(:,:,:,1), vs(2), vs(1), vs(3));
-    [du2_dy, du2_dx, du2_dz] = gradient(DVF(:,:,:,2), vs(2), vs(1), vs(3));
-    [du3_dy, du3_dx, du3_dz] = gradient(DVF(:,:,:,3), vs(2), vs(1), vs(3));
-    J11 = 1 + du1_dx; J12 = du1_dy;     J13 = du1_dz;
-    J21 = du2_dx;     J22 = 1 + du2_dy; J23 = du2_dz;
-    J31 = du3_dx;     J32 = du3_dy;     J33 = 1 + du3_dz;
-    J_det = J11.*(J22.*J33 - J23.*J32) - J12.*(J21.*J33 - J23.*J31) + J13.*(J21.*J32 - J22.*J31);
-    jac_fold = sum(J_det(:) <= 0) / numel(J_det) * 100;
-end
-
-function tre = compute_tre(DVF, pts0, pts50, vs, Xm, Ym, Zm)
-    dx = interp3(Xm, Ym, Zm, double(DVF(:,:,:,1)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
-    dy = interp3(Xm, Ym, Zm, double(DVF(:,:,:,2)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
-    dz = interp3(Xm, Ym, Zm, double(DVF(:,:,:,3)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
+function tre = compute_tre(DVF, pts0, pts50, vs)
+    dx = interp3(double(DVF(:,:,:,1)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
+    dy = interp3(double(DVF(:,:,:,2)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
+    dz = interp3(double(DVF(:,:,:,3)), pts0(:,1), pts0(:,2), pts0(:,3), 'linear', 0);
     tre = sqrt(sum((((pts0 + [dx, dy, dz]) - pts50) .* vs).^2, 2));
 end
 
